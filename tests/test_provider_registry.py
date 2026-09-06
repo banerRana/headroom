@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from headroom.providers.registry import (
     ProviderApiOverrides,
     build_proxy_provider_runtime,
@@ -9,6 +11,7 @@ from headroom.providers.registry import (
     format_backend_status,
     resolve_api_overrides,
     resolve_api_targets,
+    resolve_extra_headers,
 )
 from headroom.proxy.models import ProxyConfig
 
@@ -16,12 +19,14 @@ from headroom.proxy.models import ProxyConfig
 def test_resolve_api_overrides_prefers_explicit_values_over_environment(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://env.anthropic.example/v1")
     monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://env.openai.example/v1")
+    monkeypatch.setenv("VERTEX_TARGET_API_URL", "https://env-vertex-aiplatform.example/v1")
 
     overrides = resolve_api_overrides(
         anthropic_api_url="https://cli.anthropic.example/v1",
         openai_api_url=None,
         gemini_api_url=None,
         cloudcode_api_url=None,
+        vertex_api_url="https://cli-vertex-aiplatform.example/v1",
     )
 
     assert overrides == ProviderApiOverrides(
@@ -29,6 +34,7 @@ def test_resolve_api_overrides_prefers_explicit_values_over_environment(monkeypa
         openai="https://env.openai.example/v1",
         gemini=None,
         cloudcode=None,
+        vertex="https://cli-vertex-aiplatform.example/v1",
     )
 
 
@@ -39,6 +45,7 @@ def test_resolve_api_targets_normalizes_trailing_v1() -> None:
             openai="https://openai.example/v1",
             gemini="https://gemini.example/v1",
             cloudcode="https://cloudcode.example/v1/",
+            vertex="https://vertex.example/v1/",
         )
     )
 
@@ -46,6 +53,56 @@ def test_resolve_api_targets_normalizes_trailing_v1() -> None:
     assert targets.openai == "https://openai.example"
     assert targets.gemini == "https://gemini.example"
     assert targets.cloudcode == "https://cloudcode.example"
+    assert targets.vertex == "https://vertex.example"
+
+
+def test_copilot_openai_target_routes_anthropic_to_copilot() -> None:
+    """When the OpenAI target is a Copilot host and no Anthropic override is set,
+    the Anthropic target must default to the same Copilot host.
+
+    Copilot serves Claude models via its Anthropic surface (``/v1/messages``) on
+    the same host. Without this, Claude requests fell back to api.anthropic.com
+    and 401'd with the Copilot bearer ("Invalid bearer token", #3247).
+    """
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic=None,
+            openai="https://api.githubcopilot.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.openai == "https://api.githubcopilot.com"
+    assert targets.anthropic == "https://api.githubcopilot.com"
+
+
+def test_explicit_anthropic_override_wins_over_copilot_default() -> None:
+    """An explicit Anthropic target is never overridden by the Copilot default."""
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic="https://api.anthropic.com",
+            openai="https://api.githubcopilot.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.anthropic == "https://api.anthropic.com"
+
+
+def test_non_copilot_openai_target_leaves_anthropic_default() -> None:
+    """A non-Copilot OpenAI target must not touch the Anthropic default."""
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic=None,
+            openai="https://api.openai.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.anthropic == "https://api.anthropic.com"
 
 
 def test_proxy_config_exposes_provider_api_overrides() -> None:
@@ -54,6 +111,7 @@ def test_proxy_config_exposes_provider_api_overrides() -> None:
         openai_api_url="https://openai.example",
         gemini_api_url=None,
         cloudcode_api_url="https://cloudcode.example",
+        vertex_api_url="https://vertex.example",
     )
 
     assert config.provider_api_overrides == ProviderApiOverrides(
@@ -61,6 +119,7 @@ def test_proxy_config_exposes_provider_api_overrides() -> None:
         openai="https://openai.example",
         gemini=None,
         cloudcode="https://cloudcode.example",
+        vertex="https://vertex.example",
     )
 
 
@@ -112,13 +171,33 @@ def test_create_proxy_backend_handles_missing_litellm_backend(caplog) -> None:
             anyllm_provider="ignored",
             bedrock_region="us-east-1",
             logger=logger,
-            litellm_backend_cls=lambda provider, region: (_ for _ in ()).throw(
+            litellm_backend_cls=lambda provider, region, profile_name=None: (_ for _ in ()).throw(
                 ImportError("missing")
             ),
         )
 
     assert missing is None
     assert "LiteLLM backend not available" in caplog.text
+
+
+def test_create_proxy_backend_logs_structured_failure_details(caplog) -> None:
+    logger = logging.getLogger("test")
+
+    with caplog.at_level(logging.ERROR):
+        missing = create_proxy_backend(
+            backend="bedrock",
+            anyllm_provider="ignored",
+            bedrock_region="us-east-1",
+            logger=logger,
+            litellm_backend_cls=lambda provider, region, profile_name=None: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            ),
+        )
+
+    assert missing is None
+    assert "backend initialization failed: backend=litellm-bedrock provider=bedrock error=boom" in (
+        caplog.text
+    )
 
 
 def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None:
@@ -391,3 +470,35 @@ def test_proxy_provider_runtime_openai_transport_handles_prompt_details_without_
     assert metrics.tokens_output == 9
     assert metrics.cached_tokens == 0
     assert len(client._storage.saved) == 1
+
+
+def test_resolve_extra_headers_cli_wins_over_env(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
+    result = resolve_extra_headers('{"Cli-Header": "cli-value"}', "ANTHROPIC_TARGET_API_HEADERS")
+    assert result == {"Cli-Header": "cli-value"}
+
+
+def test_resolve_extra_headers_falls_back_to_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
+    result = resolve_extra_headers(None, "OPENAI_TARGET_API_HEADERS")
+    assert result == {"Env-Header": "env-value"}
+
+
+def test_resolve_extra_headers_unset_returns_none(monkeypatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_TARGET_API_HEADERS", raising=False)
+    assert resolve_extra_headers(None, "ANTHROPIC_TARGET_API_HEADERS") is None
+
+
+def test_resolve_extra_headers_invalid_json_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers("not json", "ANTHROPIC_TARGET_API_HEADERS")
+
+
+def test_resolve_extra_headers_non_object_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers('["a", "b"]', "ANTHROPIC_TARGET_API_HEADERS")
+
+
+def test_resolve_extra_headers_non_string_value_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers('{"Key": 123}', "ANTHROPIC_TARGET_API_HEADERS")

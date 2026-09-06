@@ -14,6 +14,7 @@ crates/
   headroom-proxy/                # binary: axum /healthz (Phase 2 grows this)
   headroom-py/                   # PyO3 cdylib exposing `headroom._core`
   headroom-parity/               # lib + `parity-run` CLI for Python parity tests
+  headroom-simulators/           # binary: deterministic local upstream stub for proxy tests
 tests/parity/
   fixtures/<transform>/*.json    # recorded Python outputs (Phase 1 ports match)
   recorder.py                    # Python-side fixture recorder
@@ -36,7 +37,7 @@ exposes the same targets:
 | `make test-parity` | Builds `headroom-py` via maturin, runs `parity-run run` |
 | `make bench` | `cargo bench --workspace` |
 | `make build-proxy` | Release-builds `headroom-proxy`, strips, prints size |
-| `make build-wheel` | `maturin build --release -m crates/headroom-py/pyproject.toml` |
+| `make build-wheel` | `maturin build --release -m crates/headroom-py/Cargo.toml` |
 | `make fmt` | `cargo fmt --all` |
 | `make lint` | `cargo fmt --check` + `cargo clippy --workspace -- -D warnings` |
 
@@ -282,15 +283,15 @@ doesn't rediscover them.
   `plugins/headroom-agent-hooks/**/plugin.json` on every commit. Those
   changes are harmless but each commit in Phase 0 picks them up. Phase 1
   does not need to do anything special — just let the hook run.
-- **`rust-toolchain.toml`** pins `channel = "stable"` rather than a specific
-  version so CI picks up the same toolchain the local box uses. Tighten to a
-  pinned version (e.g. `1.78`) once the port stabilizes.
+- **`rust-toolchain.toml`** now pins `channel = "1.95.0"` (previously tracked
+  `"stable"`, which let CI drift ahead of local dev boxes — see the file's own
+  comment for the 2026-04-27 incident this fixed). Resolved; kept here for
+  history.
 
 ## Multi-worker deployment — CCR fragmentation
 
-**Status:** PR-B7 (`REALIGNMENT/04-phase-B-live-zone.md`) introduced two
-persistent CCR backends. The single-`--workers` recommendation no longer
-applies once you select a persistent backend.
+**Status:** two persistent CCR backends are available. The single-`--workers`
+recommendation no longer applies once you select a persistent backend.
 
 ### Backend selection
 
@@ -329,29 +330,37 @@ in-memory.
 
 ### What goes wrong with the in-memory backend on `--workers N > 1`
 
-(Historical context — applies only when the operator explicitly
-chooses `CcrBackendConfig::InMemory`.) Each uvicorn worker is a
-separate Python process. Each process holds its own copies of:
+Each uvicorn worker is a separate Python process. The following state is
+fragmented across workers:
 
-1. **`InMemoryCcrStore`** — sharded `DashMap` mapping
-   `hash → original_content` for content the compressor replaced with
-   `<<ccr:HASH>>` markers.
-2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py:367`)
-   — per-session `CompressionCache` dict.
+1. **Python `CompressionStore`** — defaults to `SQLiteBackend` at
+   `workspace_dir()/ccr_store.db` (restart-safe, shared across workers) when
+   `HEADROOM_CCR_BACKEND` is unset or `"sqlite"` (`_create_default_ccr_backend`
+   in `headroom/cache/compression_store.py`). Set `HEADROOM_CCR_BACKEND=memory`
+   to opt into the per-process `InMemoryBackend` instead — that is the setting
+   this section's fragmentation risk actually applies to; the log messages in
+   `headroom/proxy/server.py` (see below) still assume in-memory-by-default and
+   are stale on this point.
+2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py`)
+   — per-session `CompressionCache` dict (instance var, always per-worker).
 3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker
-   state derived from Anthropic's `cache_read_input_tokens` responses.
-4. **TOIN learner state** — pattern statistics used to bias the compressor.
+   state derived from Anthropic's `cache_read_input_tokens` responses
+   (instance var, always per-worker).
+4. **TOIN learner state** — writes snapshots to `~/.headroom/toin.json` but
+   keeps per-process in-memory state; pattern statistics on one worker are not
+   visible to others until the next disk flush.
 
 When uvicorn round-robins requests across workers, a session whose
 turn-1 landed on worker A may have turn-2 land on worker B. Worker B has
 zero knowledge of what worker A did, the `<<ccr:HASH>>` marker resolves
 to `None`, and the model sees an opaque directive it can't act on.
 Switching to `SqliteCcrStore` (default) or `RedisCcrStore` resolves the
-fragmentation directly.
+CCR fragmentation; a sticky-session load balancer resolves all of them.
 
 ### Detecting it in the wild
 
-The proxy emits a `WARNING`-level log line on startup if the configured
-backend is `InMemoryCcrStore` AND `WEB_CONCURRENCY` / uvicorn
-`--workers` is > 1, pointing operators at this section. The other two
-backends never warn — they're the supported multi-worker paths.
+The proxy emits a `WARNING`-level log line on startup when `--workers N > 1`.
+When `HEADROOM_CCR_BACKEND` is unset (default InMemoryBackend), the warning
+includes CCR retrieval failures and suggests setting `HEADROOM_CCR_BACKEND=sqlite`.
+When a cross-worker backend is already configured, the warning covers only the
+remaining per-worker stores (compression cache, prefix tracker, TOIN, CostTracker).

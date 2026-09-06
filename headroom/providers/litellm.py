@@ -22,8 +22,10 @@ Requires: pip install litellm
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -32,7 +34,17 @@ logger = logging.getLogger(__name__)
 
 # Check if litellm is available
 try:
+    # LiteLLM can print its provider-list banner during import, before the
+    # module-level suppression flags below can be set.
+    os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "True")
+
     import litellm
+
+    # Suppress litellm's startup banner ("Provider List: https://...") and
+    # verbose debug output that spams stdout on every worker import.
+    litellm.suppress_debug_info = True
+    litellm.set_verbose = False
+
     from litellm import get_model_info as litellm_get_model_info
     from litellm import model_cost as litellm_model_cost
     from litellm import token_counter as litellm_token_counter
@@ -229,19 +241,13 @@ class LiteLLMProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        try:
-            # LiteLLM's cost calculation
-            cost = litellm.completion_cost(
-                model=model,
-                prompt="",  # We're using token counts directly
-                completion="",
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-            )
-            return cost
-        except Exception as e:
-            logger.debug(f"LiteLLM cost estimation failed for {model}: {e}")
-            return None
+        # LiteLLM's cost calculation, from token counts directly.
+        return estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
 
     @classmethod
     def list_supported_providers(cls) -> list[str]:
